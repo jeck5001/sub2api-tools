@@ -2,22 +2,50 @@
 
 Sub2API 管理后台的 **Tampermonkey 用户脚本工具集**。提供统一浮动入口（FAB「Sub2API 工具」）与可插拔工具面板；首个内置工具为 **Grok 批量额度探测**。
 
-## 安装
+## 安装（推荐：从 GitHub 安装，可自动更新）
 
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)。
-2. 构建产物（或直接用已构建的文件）：
+2. 打开安装地址（油猴会弹出安装确认）：
 
-   ```bash
-   ./build.sh
-   # 或
-   npm run build
-   ```
+   **https://raw.githubusercontent.com/jeck5001/sub2api-tools/main/dist/sub2api-tools.user.js**
 
-3. 在 Tampermonkey 中新建脚本，粘贴 `dist/sub2api-tools.user.js` 全文；  
-   或使用「从文件安装 / 本地文件 URL」指向该文件。
-4. 打开任意 Sub2API 后台 `/admin/*` 页面；右下角出现 **Sub2API 工具**。  
+   或在油猴仪表盘 → **实用工具** → **从 URL 安装**，粘贴同一链接。
+3. 打开任意 Sub2API 后台 `/admin/*` 页面；右下角出现 **Sub2API 工具**。  
    - 快捷键：`Alt+Q` 打开/关闭外壳  
-   - 在 `/admin/accounts` 页可额外看到工具栏按钮：「批量额度探测」「读取本页 forbidden」
+   - 在 `/admin/accounts` 页可额外看到工具栏按钮：「批量额度探测」「读取本页 forbidden」「删除本页错误」
+
+### 自动更新
+
+脚本头已配置：
+
+| 字段 | 地址 |
+|------|------|
+| `@updateURL` / `@downloadURL` | `https://raw.githubusercontent.com/jeck5001/sub2api-tools/main/dist/sub2api-tools.user.js` |
+
+Tampermonkey 会按设置定期对比远程 `@version`，有新版本时提示或自动更新。
+
+**油猴侧建议：**
+
+1. 打开油猴仪表盘 → 点脚本 **Sub2API Tools** → 设置  
+2. 确认 **检查更新** 已开启（或全局设置里允许检查更新）  
+3. 手动检查：脚本列表里对该脚本点「检查更新 / 强制更新」
+
+**开发者发版时**（改代码后让别人自动升到新版本）：
+
+1. 改 `src/meta.header.js` 的 `@version`（以及 `package.json` / `bootstrap.js` 的 version）  
+2. `./build.sh`（把新版本写进 `dist/`）  
+3. `git commit` + `git push origin main`  
+4. 用户端下次检查更新即可拉到新 `@version`
+
+> 若你是本地文件粘贴安装的旧副本、且没有 `@updateURL`，请用上面的 raw 链接**重装一次**，之后才会自动更新。
+
+### 本地开发安装
+
+```bash
+./build.sh   # 或 npm run build
+```
+
+再把 `dist/sub2api-tools.user.js` 粘贴进油猴，或从文件安装。开发机也可用 raw 链接安装生产构建。
 
 ### 从旧版迁移
 

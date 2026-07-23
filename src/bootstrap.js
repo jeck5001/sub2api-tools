@@ -3,7 +3,7 @@
 
   /** @type {any} */
   const S2A = (window.__S2A__ = window.__S2A__ || {});
-  S2A.version = '2.1.0';
+  S2A.version = '2.1.1';
   S2A.NS = 's2a';
   S2A.util = S2A.util || {};
   S2A.storage = S2A.storage || {};
