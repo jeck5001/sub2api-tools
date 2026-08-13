@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sub2API Tools
 // @namespace    s2a.sub2api-tools
-// @version      2.2.2
+// @version      2.2.3
 // @description  Sub2API 管理后台工具集：Grok 额度探测、批量删除错误账号、批量删除停用账号等
 // @author       local
 // @license      MIT
@@ -25,7 +25,7 @@
 
   /** @type {any} */
   const S2A = (window.__S2A__ = window.__S2A__ || {});
-  S2A.version = '2.2.2';
+  S2A.version = '2.2.3';
   S2A.NS = 's2a';
   S2A.util = S2A.util || {};
   S2A.storage = S2A.storage || {};
@@ -2733,10 +2733,15 @@
   const { sleep } = S2A.util;
 
   function startDelete(opts) {
-    const { ids, accountMeta, results, cfg, log, onUpdate, getAbort } = opts;
+    const { ids, accountMeta, results, cfg, log, onProgress, getAbort } = opts;
 
     let cursor = 0;
     let successCount = 0;
+    let failureCount = 0;
+    let doneCount = 0;
+    const reportProgress = () => {
+      if (onProgress) onProgress({ total: ids.length, done: doneCount, ok: successCount, err: failureCount });
+    };
     const workers = Array.from({ length: cfg.concurrency }, async () => {
       while (!getAbort()) {
         const i = cursor++;
@@ -2745,7 +2750,6 @@
         const row = results.get(id);
         if (!row) continue;
         row.state = 'run';
-        if (onUpdate) onUpdate();
 
         try {
           if (cfg.delayMs > 0) await sleep(cfg.delayMs);
@@ -2762,9 +2766,13 @@
           row.deleted = false;
           row.error = err.message || String(err);
           row.note = row.error;
-          if (log) log(`#${id} 删除失败: ${row.error}`);
+          failureCount += 1;
+          if (log && (failureCount === 1 || failureCount % 50 === 0)) {
+            log(`删除失败：${failureCount} 个，最近错误：${row.error}`);
+          }
         }
-        if (onUpdate) onUpdate();
+        doneCount += 1;
+        reportProgress();
       }
     });
 
@@ -2787,19 +2795,22 @@
   const PREFIX = 's2a-tool-dis-';
 
   const DEFAULT_CFG = {
-    concurrency: 20,
+    concurrency: 50,
     delayMs: 0,
     onlyGrok: false,
     requireConfirm: true,
     timezone: 'Asia/Shanghai',
-    configVersion: 2,
+    configVersion: 3,
   };
 
   function loadCfg() {
     const stored = S2A.storage.getToolCfg(TOOL_ID, {});
     const cfg = { ...DEFAULT_CFG, ...stored };
-    // Upgrade the original 3-worker/200ms defaults without overriding a newer config.
-    if (!stored.configVersion && stored.concurrency === 3 && stored.delayMs === 200) {
+    // Upgrade prior shipped defaults without overriding a user-selected setting.
+    if (
+      (!stored.configVersion && stored.concurrency === 3 && stored.delayMs === 200) ||
+      (stored.configVersion === 2 && stored.concurrency === 20 && stored.delayMs === 0)
+    ) {
       cfg.concurrency = DEFAULT_CFG.concurrency;
       cfg.delayMs = DEFAULT_CFG.delayMs;
       cfg.configVersion = DEFAULT_CFG.configVersion;
@@ -2818,6 +2829,7 @@
     let abortFlag = false;
     let runStartedAt = 0;
     let runCfg = null;
+    let progress = { total: 0, done: 0, ok: 0, err: 0 };
     const results = new Map();
     const accountMeta = new Map();
 
@@ -2833,12 +2845,12 @@
       </div>
       <div class="s2a-row">
         <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-only-grok" ${cfg.onlyGrok ? 'checked' : ''}> 仅 Grok</label>
-        <label class="s2a-lbl">并发 <input type="number" id="${PREFIX}-concurrency" min="1" max="100" value="${esc(cfg.concurrency)}"></label>
+        <label class="s2a-lbl">并发 <input type="number" id="${PREFIX}-concurrency" min="1" max="200" value="${esc(cfg.concurrency)}"></label>
         <label class="s2a-lbl">间隔ms <input type="number" id="${PREFIX}-delay" min="0" max="10000" value="${esc(cfg.delayMs)}"></label>
         <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-confirm" ${cfg.requireConfirm !== false ? 'checked' : ''}> 删除前确认</label>
       </div>
       <div class="s2a-muted" style="margin-bottom:8px">
-        匹配状态列标签「停用」/ disabled / inactive。删除调用 DELETE /admin/accounts/{id}，不可恢复，请确认后再执行。
+        匹配状态列标签「停用」/ disabled / inactive。运行中仅显示删除中和失败项以保持批量删除速度。删除调用 DELETE /admin/accounts/{id}，不可恢复，请确认后再执行。
       </div>
       <textarea id="${PREFIX}-ids" placeholder="账号 ID，每行一个。建议先点「读取本页停用」。&#10;示例：&#10;7752&#10;7753"></textarea>
       <div class="s2a-row" style="margin-top:8px">
@@ -2902,11 +2914,7 @@
     }
 
     function updateStats() {
-      const all = Array.from(results.values());
-      const total = all.length;
-      const done = all.filter((x) => ['del', 'del_fail'].includes(x.state)).length;
-      const ok = all.filter((x) => x.state === 'del').length;
-      const err = all.filter((x) => x.state === 'del_fail').length;
+      const { total, done, ok, err } = progress;
       const set = (id, v) => {
         const el = document.getElementById(id);
         if (el) el.textContent = String(v);
@@ -2950,7 +2958,10 @@
       const tbody = document.getElementById(`${PREFIX}-tbody`);
       if (!tbody) return;
       const rank = { run: 0, del_fail: 1, del: 2, wait: 3 };
-      const rows = Array.from(results.values()).sort((a, b) => {
+      const sourceRows = running
+        ? Array.from(results.values()).filter((r) => r.state === 'run' || r.state === 'del_fail')
+        : Array.from(results.values());
+      const rows = sourceRows.sort((a, b) => {
         const ao = rank[a.state] ?? 9;
         const bo = rank[b.state] ?? 9;
         if (ao !== bo) return ao - bo;
@@ -2979,7 +2990,7 @@
     function readPanelCfg() {
       const concurrency = Math.max(
         1,
-        Math.min(100, Number($(`#${PREFIX}-concurrency`, root)?.value || cfg.concurrency) || 20)
+        Math.min(200, Number($(`#${PREFIX}-concurrency`, root)?.value || cfg.concurrency) || 50)
       );
       const delayMs = Math.max(
         0,
@@ -3034,6 +3045,7 @@
       runStartedAt = Date.now();
       runCfg = { ...cfg };
       results.clear();
+      progress = { total: ids.length, done: 0, ok: 0, err: 0 };
       for (const id of ids) {
         const meta = accountMeta.get(id) || {};
         results.set(id, {
@@ -3070,7 +3082,8 @@
         renderTable();
         updateStats();
       };
-      const scheduleRender = () => {
+      const scheduleRender = (nextProgress) => {
+        if (nextProgress) progress = nextProgress;
         updateStats();
         renderPending = true;
         if (renderTimer) return;
@@ -3083,7 +3096,7 @@
         results,
         cfg,
         log,
-        onUpdate: scheduleRender,
+        onProgress: scheduleRender,
         getAbort: () => abortFlag,
       });
 
@@ -3094,8 +3107,8 @@
       updateStats();
       if (startBtn) startBtn.disabled = false;
       if (stopBtn) stopBtn.disabled = true;
-      const deleted = Array.from(results.values()).filter((r) => r.state === 'del').length;
-      const failed = Array.from(results.values()).filter((r) => r.state === 'del_fail').length;
+      const deleted = progress.ok;
+      const failed = progress.err;
       log(abortFlag ? '已停止' : `全部完成 · 已删=${deleted} · 失败=${failed}`);
     }
 

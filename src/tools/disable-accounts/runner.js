@@ -4,10 +4,15 @@
   const { sleep } = S2A.util;
 
   function startDelete(opts) {
-    const { ids, accountMeta, results, cfg, log, onUpdate, getAbort } = opts;
+    const { ids, accountMeta, results, cfg, log, onProgress, getAbort } = opts;
 
     let cursor = 0;
     let successCount = 0;
+    let failureCount = 0;
+    let doneCount = 0;
+    const reportProgress = () => {
+      if (onProgress) onProgress({ total: ids.length, done: doneCount, ok: successCount, err: failureCount });
+    };
     const workers = Array.from({ length: cfg.concurrency }, async () => {
       while (!getAbort()) {
         const i = cursor++;
@@ -16,7 +21,6 @@
         const row = results.get(id);
         if (!row) continue;
         row.state = 'run';
-        if (onUpdate) onUpdate();
 
         try {
           if (cfg.delayMs > 0) await sleep(cfg.delayMs);
@@ -33,9 +37,13 @@
           row.deleted = false;
           row.error = err.message || String(err);
           row.note = row.error;
-          if (log) log(`#${id} 删除失败: ${row.error}`);
+          failureCount += 1;
+          if (log && (failureCount === 1 || failureCount % 50 === 0)) {
+            log(`删除失败：${failureCount} 个，最近错误：${row.error}`);
+          }
         }
-        if (onUpdate) onUpdate();
+        doneCount += 1;
+        reportProgress();
       }
     });
 
