@@ -1,7 +1,7 @@
 {
   "name": "sub2api-tools",
-  "version": "2.1.2",
-  "description": "Sub2API admin userscript toolset (Tampermonkey) — Grok quota, delete error accounts, plugins",
+  "version": "2.2.0",
+  "description": "Sub2API admin userscript toolset (Tampermonkey) — Grok quota, delete error accounts, disable accounts, plugins",
   "private": true,
   "scripts": {
     "build": "bash build.sh"
