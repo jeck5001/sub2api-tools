@@ -7,15 +7,25 @@
   const PREFIX = 's2a-tool-dis-';
 
   const DEFAULT_CFG = {
-    concurrency: 3,
-    delayMs: 200,
+    concurrency: 20,
+    delayMs: 0,
     onlyGrok: false,
     requireConfirm: true,
     timezone: 'Asia/Shanghai',
+    configVersion: 2,
   };
 
   function loadCfg() {
-    return S2A.storage.getToolCfg(TOOL_ID, DEFAULT_CFG);
+    const stored = S2A.storage.getToolCfg(TOOL_ID, {});
+    const cfg = { ...DEFAULT_CFG, ...stored };
+    // Upgrade the original 3-worker/200ms defaults without overriding a newer config.
+    if (!stored.configVersion && stored.concurrency === 3 && stored.delayMs === 200) {
+      cfg.concurrency = DEFAULT_CFG.concurrency;
+      cfg.delayMs = DEFAULT_CFG.delayMs;
+      cfg.configVersion = DEFAULT_CFG.configVersion;
+      S2A.storage.setToolCfg(TOOL_ID, cfg);
+    }
+    return cfg;
   }
 
   function saveCfg(cfg) {
@@ -41,7 +51,7 @@
       </div>
       <div class="s2a-row">
         <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-only-grok" ${cfg.onlyGrok ? 'checked' : ''}> 仅 Grok</label>
-        <label class="s2a-lbl">并发 <input type="number" id="${PREFIX}-concurrency" min="1" max="20" value="${esc(cfg.concurrency)}"></label>
+        <label class="s2a-lbl">并发 <input type="number" id="${PREFIX}-concurrency" min="1" max="100" value="${esc(cfg.concurrency)}"></label>
         <label class="s2a-lbl">间隔ms <input type="number" id="${PREFIX}-delay" min="0" max="10000" value="${esc(cfg.delayMs)}"></label>
         <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-confirm" ${cfg.requireConfirm !== false ? 'checked' : ''}> 删除前确认</label>
       </div>
@@ -159,7 +169,7 @@
     function readPanelCfg() {
       const concurrency = Math.max(
         1,
-        Math.min(20, Number($(`#${PREFIX}-concurrency`, root)?.value || cfg.concurrency) || 3)
+        Math.min(100, Number($(`#${PREFIX}-concurrency`, root)?.value || cfg.concurrency) || 20)
       );
       const delayMs = Math.max(
         0,
@@ -235,20 +245,36 @@
 
       log(`开始删除 ${ids.length} 个账号，并发=${cfg.concurrency}，间隔=${cfg.delayMs}ms`);
 
+      let renderTimer = null;
+      let renderPending = false;
+      const flushRender = () => {
+        if (renderTimer) {
+          clearTimeout(renderTimer);
+          renderTimer = null;
+        }
+        renderPending = false;
+        renderTable();
+        updateStats();
+      };
+      const scheduleRender = () => {
+        updateStats();
+        renderPending = true;
+        if (renderTimer) return;
+        renderTimer = setTimeout(flushRender, 500);
+      };
+
       const job = T.startDelete({
         ids,
         accountMeta,
         results,
         cfg,
         log,
-        onUpdate: () => {
-          renderTable();
-          updateStats();
-        },
+        onUpdate: scheduleRender,
         getAbort: () => abortFlag,
       });
 
       await job.done;
+      if (renderPending || renderTimer) flushRender();
       running = false;
       if (startBtn) startBtn.disabled = false;
       if (stopBtn) stopBtn.disabled = true;

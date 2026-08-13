@@ -7,6 +7,7 @@
     const { ids, accountMeta, results, cfg, log, onUpdate, getAbort } = opts;
 
     let cursor = 0;
+    let successCount = 0;
     const workers = Array.from({ length: cfg.concurrency }, async () => {
       while (!getAbort()) {
         const i = cursor++;
@@ -23,7 +24,10 @@
           row.state = 'del';
           row.deleted = true;
           row.note = row.note || '已删除';
-          if (log) log(`#${id} 已删除${row.name ? ` ${row.name}` : ''}`);
+          successCount += 1;
+          if (log && (successCount === 1 || successCount % 100 === 0)) {
+            log(`删除进度：已删 ${successCount} 个`);
+          }
         } catch (err) {
           row.state = 'del_fail';
           row.deleted = false;
