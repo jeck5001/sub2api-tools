@@ -23,6 +23,9 @@ FILES=(
   "src/tools/delete-error-accounts/runner.js"
   "src/tools/delete-error-accounts/panel.js"
   "src/tools/delete-error-accounts/index.js"
+  "src/tools/disable-accounts/runner.js"
+  "src/tools/disable-accounts/panel.js"
+  "src/tools/disable-accounts/index.js"
   "src/tools/register-all.js"
   "src/main.js"
 )
@@ -68,6 +71,10 @@ if ! grep -q '批量删除错误账号' "$OUT"; then
   echo "ERROR: output missing delete-error-accounts tool" >&2
   exit 1
 fi
+if ! grep -q '批量删除停用账号' "$OUT"; then
+  echo "ERROR: output missing disable-accounts tool" >&2
+  exit 1
+fi
 if ! grep -q 'Sub2API 工具' "$OUT"; then
   echo "ERROR: output missing shell FAB label" >&2
   exit 1
@@ -76,4 +83,3 @@ fi
 BYTES=$(wc -c < "$OUT" | tr -d ' ')
 LINES=$(wc -l < "$OUT" | tr -d ' ')
 echo "Built $OUT ($LINES lines, $BYTES bytes)"
-
