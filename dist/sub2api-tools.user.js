@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sub2API Tools
 // @namespace    s2a.sub2api-tools
-// @version      2.2.1
+// @version      2.2.2
 // @description  Sub2API 管理后台工具集：Grok 额度探测、批量删除错误账号、批量删除停用账号等
 // @author       local
 // @license      MIT
@@ -19,14 +19,13 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-
 /* ==== src/bootstrap.js ==== */
 (function () {
   'use strict';
 
   /** @type {any} */
   const S2A = (window.__S2A__ = window.__S2A__ || {});
-  S2A.version = '2.2.1';
+  S2A.version = '2.2.2';
   S2A.NS = 's2a';
   S2A.util = S2A.util || {};
   S2A.storage = S2A.storage || {};
@@ -2817,6 +2816,8 @@
     let cfg = loadCfg();
     let running = false;
     let abortFlag = false;
+    let runStartedAt = 0;
+    let runCfg = null;
     const results = new Map();
     const accountMeta = new Map();
 
@@ -2846,11 +2847,12 @@
         <button type="button" class="s2a-btn s2a-btn-secondary" data-act="export">导出 CSV</button>
         <button type="button" class="s2a-btn s2a-btn-ok" data-act="copy-summary">复制摘要</button>
       </div>
-      <div class="s2a-stats" style="grid-template-columns: repeat(4, 1fr)">
+      <div class="s2a-stats" style="grid-template-columns: repeat(5, 1fr)">
         <div class="s2a-stat"><b id="${PREFIX}-st-total">0</b><span>总数</span></div>
         <div class="s2a-stat"><b id="${PREFIX}-st-done">0</b><span>完成</span></div>
         <div class="s2a-stat"><b id="${PREFIX}-st-ok">0</b><span>已删</span></div>
         <div class="s2a-stat"><b id="${PREFIX}-st-err">0</b><span>失败</span></div>
+        <div class="s2a-stat"><b id="${PREFIX}-st-eta">—</b><span>预计剩余</span></div>
       </div>
       <div class="s2a-progress"><i id="${PREFIX}-progress-bar"></i></div>
       <div class="s2a-table-wrap">
@@ -2913,8 +2915,35 @@
       set(`${PREFIX}-st-done`, done);
       set(`${PREFIX}-st-ok`, ok);
       set(`${PREFIX}-st-err`, err);
+      const etaEl = document.getElementById(`${PREFIX}-st-eta`);
+      if (etaEl) etaEl.textContent = getEtaText(total, done);
       const bar = document.getElementById(`${PREFIX}-progress-bar`);
       if (bar) bar.style.width = total ? `${Math.round((done / total) * 100)}%` : '0%';
+    }
+
+    function formatDuration(seconds) {
+      const totalSeconds = Math.max(0, Math.ceil(seconds));
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const secs = totalSeconds % 60;
+      if (hours) return `${hours}小时${minutes}分`;
+      if (minutes) return `${minutes}分${secs}秒`;
+      return `${secs}秒`;
+    }
+
+    function getEtaText(total, done) {
+      if (!running || !runCfg || !total) return '—';
+      if (done >= total) return '已完成';
+
+      const remaining = total - done;
+      if (done > 0) {
+        const elapsedSeconds = (Date.now() - runStartedAt) / 1000;
+        return `约${formatDuration((elapsedSeconds / done) * remaining)}`;
+      }
+
+      // Show an initial estimate until the first delete request completes.
+      const requestSeconds = Math.max(0.5, runCfg.delayMs / 1000 + 0.5);
+      return `约${formatDuration((Math.ceil(total / runCfg.concurrency) * requestSeconds))}`;
     }
 
     function renderTable() {
@@ -3002,6 +3031,8 @@
 
       running = true;
       abortFlag = false;
+      runStartedAt = Date.now();
+      runCfg = { ...cfg };
       results.clear();
       for (const id of ids) {
         const meta = accountMeta.get(id) || {};
@@ -3025,6 +3056,8 @@
       if (stopBtn) stopBtn.disabled = false;
 
       log(`开始删除 ${ids.length} 个账号，并发=${cfg.concurrency}，间隔=${cfg.delayMs}ms`);
+
+      const etaTimer = setInterval(updateStats, 1000);
 
       let renderTimer = null;
       let renderPending = false;
@@ -3055,8 +3088,10 @@
       });
 
       await job.done;
+      clearInterval(etaTimer);
       if (renderPending || renderTimer) flushRender();
       running = false;
+      updateStats();
       if (startBtn) startBtn.disabled = false;
       if (stopBtn) stopBtn.disabled = true;
       const deleted = Array.from(results.values()).filter((r) => r.state === 'del').length;
