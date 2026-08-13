@@ -7,7 +7,7 @@
     S2A.registerTool({
       id: 'disable-accounts',
       name: '批量删除停用账号',
-      description: '扫描状态=禁用 的账号并批量删除（需确认）',
+      description: '扫描状态=停用 的账号并批量删除（需确认）',
       order: 20,
       match: (ctx) => /\/admin\/accounts\b/.test(ctx.pathname),
       barActions: () => [
@@ -27,7 +27,7 @@
                 `本页停用账号：${items.length} 个` +
                   (items.length ? ` → ${items.map((x) => x.id).join(',')}` : '')
               );
-              if (!items.length) alert('当前页未找到状态为「禁用」的账号');
+              if (!items.length) alert('当前页未找到状态为「停用」的账号');
             }, 50);
           },
         },

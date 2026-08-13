@@ -33,10 +33,10 @@
     root.id = `${PREFIX}-root`;
     root.innerHTML = `
       <div class="s2a-row">
-        <button type="button" class="s2a-btn s2a-btn-danger" data-act="read-disabled" title="扫描当前页「状态」列为「禁用」的账号">读取本页禁用</button>
+        <button type="button" class="s2a-btn s2a-btn-danger" data-act="read-disabled" title="扫描当前页「状态」列为「停用」的账号">读取本页停用</button>
         <button type="button" class="s2a-btn s2a-btn-secondary" data-act="read-selected">读取勾选</button>
         <button type="button" class="s2a-btn s2a-btn-secondary" data-act="read-page">读取本页</button>
-        <button type="button" class="s2a-btn s2a-btn-secondary" data-act="read-all-disabled" title="分页拉取账号列表，按状态筛选禁用（兼容服务端无 status 过滤时的客户端筛选）">拉取全部禁用(API)</button>
+        <button type="button" class="s2a-btn s2a-btn-secondary" data-act="read-all-disabled" title="分页拉取账号列表，按状态筛选停用（兼容服务端无 status 过滤时的客户端筛选）">拉取全部停用(API)</button>
         <span class="s2a-muted" id="${PREFIX}-sel-info">未选择</span>
       </div>
       <div class="s2a-row">
@@ -46,9 +46,9 @@
         <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-confirm" ${cfg.requireConfirm !== false ? 'checked' : ''}> 删除前确认</label>
       </div>
       <div class="s2a-muted" style="margin-bottom:8px">
-        匹配状态列粉红标签「禁用」/ disabled。删除调用 DELETE /admin/accounts/{id}，不可恢复，请确认后再执行。
+        匹配状态列标签「停用」/ disabled / inactive。删除调用 DELETE /admin/accounts/{id}，不可恢复，请确认后再执行。
       </div>
-      <textarea id="${PREFIX}-ids" placeholder="账号 ID，每行一个。建议先点「读取本页禁用」。&#10;示例：&#10;7752&#10;7753"></textarea>
+      <textarea id="${PREFIX}-ids" placeholder="账号 ID，每行一个。建议先点「读取本页停用」。&#10;示例：&#10;7752&#10;7753"></textarea>
       <div class="s2a-row" style="margin-top:8px">
         <button type="button" class="s2a-btn s2a-btn-danger" data-act="start">开始删除</button>
         <button type="button" class="s2a-btn s2a-btn-secondary" data-act="stop" disabled>停止</button>
@@ -149,7 +149,7 @@
             <td>${esc(r.id)}</td>
             <td>${esc(r.name || '—')}</td>
             <td>${tag}</td>
-            <td>${esc(r.statusText || r.statusType || '禁用')}</td>
+            <td>${esc(r.statusText || r.statusType || '停用')}</td>
             <td class="s2a-muted">${esc(r.note || r.error || '')}</td>
           </tr>`;
         })
@@ -197,12 +197,12 @@
         }
       }
       if (!ids.length) {
-        alert('请先读取本页禁用账号，或手动填入账号 ID');
+        alert('请先读取本页停用账号，或手动填入账号 ID');
         return;
       }
 
       const tip =
-        `即将删除 ${ids.length} 个账号（状态筛选为「禁用」装载，最终以 ID 列表为准）。\n\n` +
+        `即将删除 ${ids.length} 个账号（状态筛选为「停用」装载，最终以 ID 列表为准）。\n\n` +
         `操作不可恢复：DELETE /admin/accounts/{id}\n\n是否继续？`;
       if (cfg.requireConfirm && !confirm(tip)) {
         log('已取消删除');
@@ -219,7 +219,7 @@
           name: meta.name || '',
           state: 'wait',
           statusType: meta.statusType || 'disabled',
-          statusText: meta.statusText || '禁用',
+          statusText: meta.statusText || '停用',
           note: '',
           error: '',
           deleted: false,
@@ -319,8 +319,8 @@
       if (act === 'read-disabled') {
         const items = S2A.domAccounts.collectByStatusFromDom(collectOpts());
         fillIds(items);
-        log(`本页禁用账号：${items.length} 个` + (items.length ? ` → ${items.map((x) => x.id).join(',')}` : ''));
-        if (!items.length) alert('当前页未找到状态为「禁用」的账号');
+        log(`本页停用账号：${items.length} 个` + (items.length ? ` → ${items.map((x) => x.id).join(',')}` : ''));
+        if (!items.length) alert('当前页未找到状态为「停用」的账号');
         return;
       }
       if (act === 'read-selected') {
@@ -356,9 +356,9 @@
             });
           }
           fillIds(items);
-          log(`API 拉取禁用账号：${items.length} 个`);
+          log(`API 拉取停用账号：${items.length} 个`);
           if (!items.length) {
-            alert('API 未筛出禁用账号。可能后端 status 字段与 UI 不一致。\n请改用「读取本页禁用」并翻页处理。');
+            alert('API 未筛出停用账号。可能后端 status 字段与 UI 不一致。\n请改用「读取本页停用」并翻页处理。');
           }
         } catch (err) {
           log(`API 拉取失败：${err.message || err}`);

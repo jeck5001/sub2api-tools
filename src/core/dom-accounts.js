@@ -79,7 +79,7 @@
         .filter((t) => t && !/^#\d+$/.test(t) && t.length < 80);
       const email = texts.find((t) => t.includes('@'));
       if (email) return email;
-      return texts.find((t) => !/grok|oauth|api|启用|禁用|正常|错误/i.test(t)) || '';
+      return texts.find((t) => !/grok|oauth|api|启用|停用|禁用|正常|错误/i.test(t)) || '';
     }
 
     function shouldSkipNonGrok(row, onlyGrok) {
@@ -101,7 +101,7 @@
         { type: 'error', re: /^(错误|error|failed|fail)$/i },
         { type: 'error', re: /错误|error|failed/i },
         { type: 'normal', re: /^(正常|normal|ok|active|healthy|enabled)$/i },
-        { type: 'disabled', re: /^(禁用|disabled|inactive)$/i },
+        { type: 'disabled', re: /^(停用|禁用|disabled|inactive)$/i },
         { type: 'warning', re: /^(警告|warning|warn)$/i },
       ];
 
@@ -109,7 +109,7 @@
         const t = (el.textContent || '').trim();
         if (!t || t.length > 24) return false;
         // Prefer badge-like short labels
-        return /错误|正常|禁用|警告|error|normal|disabled|warning|ok|active|failed/i.test(t);
+        return /错误|正常|停用|禁用|警告|error|normal|disabled|warning|ok|active|failed/i.test(t);
       });
 
       for (const el of nodes) {
@@ -149,7 +149,7 @@
       const s = String(raw ?? '').trim().toLowerCase();
       if (!s) return '';
       if (/(错误|error|failed|fail)/.test(s)) return 'error';
-      if (/(禁用|disabled|inactive)/.test(s)) return 'disabled';
+      if (/(停用|禁用|disabled|inactive)/.test(s)) return 'disabled';
       if (/(警告|warning|warn)/.test(s)) return 'warning';
       if (/(正常|normal|ok|active|healthy|enabled)/.test(s)) return 'normal';
       return s;
@@ -421,4 +421,3 @@
       fetchAllAccountIdsFromApi,
     };
   })(S2A);
-
