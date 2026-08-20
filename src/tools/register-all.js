@@ -3,6 +3,9 @@
   if (S2A.tools['grok-quota'] && typeof S2A.tools['grok-quota'].register === 'function') {
     S2A.tools['grok-quota'].register();
   }
+  if (S2A.tools['grok-degrade'] && typeof S2A.tools['grok-degrade'].register === 'function') {
+    S2A.tools['grok-degrade'].register();
+  }
   if (
     S2A.tools['delete-error-accounts'] &&
     typeof S2A.tools['delete-error-accounts'].register === 'function'

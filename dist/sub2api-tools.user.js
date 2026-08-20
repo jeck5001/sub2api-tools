@@ -2179,6 +2179,765 @@
 
 
 
+/* ==== src/tools/grok-degrade/export.js ==== */
+  // --- Grok degrade export ---
+  (function (S2A) {
+    const G = (S2A.tools['grok-degrade'] = S2A.tools['grok-degrade'] || {});
+
+    function exportCsv(results, log) {
+      const rows = Array.from(results.values());
+      if (!rows.length) {
+        alert('没有可导出的结果');
+        return;
+      }
+      const header = ['id', 'name', 'state', 'degraded', 'model', 'note', 'error'];
+      const lines = [header.join(',')];
+      for (const r of rows) {
+        const cols = [
+          r.id,
+          r.name,
+          r.state,
+          r.state === 'degraded' ? '1' : r.state === 'ok' ? '0' : '',
+          r.model,
+          r.note,
+          r.error,
+        ].map((v) => {
+          const s = String(v ?? '');
+          return /["\n,]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        });
+        lines.push(cols.join(','));
+      }
+      const blob = new Blob(['\ufeff' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+      S2A.util.downloadBlob(
+        blob,
+        `grok-degrade-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`
+      );
+      if (log) log(`已导出 CSV ${rows.length} 行`);
+    }
+
+    async function copySummary(results, log) {
+      const rows = Array.from(results.values());
+      const degraded = rows.filter((r) => r.state === 'degraded');
+      const ok = rows.filter((r) => r.state === 'ok');
+      const unknown = rows.filter((r) => r.state === 'unknown');
+      const err = rows.filter((r) => r.state === 'err');
+      const lines = [
+        `Grok 降智检测摘要 ${new Date().toLocaleString()}`,
+        `总数 ${rows.length} · 降智 ${degraded.length} · 正常 ${ok.length} · 未知 ${unknown.length} · 失败 ${err.length}`,
+        '',
+      ];
+      if (degraded.length) {
+        lines.push('疑似降智:');
+        degraded.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  模型:${r.model || '?'}  ${r.note || ''}`));
+        lines.push('');
+      }
+      if (unknown.length) {
+        lines.push('无法确认:');
+        unknown.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  ${r.note || ''}`));
+        lines.push('');
+      }
+      if (err.length) {
+        lines.push('失败:');
+        err.forEach((r) => lines.push(`#${r.id} [${r.is403 ? '403' : 'err'}] ${r.error || r.note}`));
+      }
+      const text = lines.join('\n');
+      try {
+        await navigator.clipboard.writeText(text);
+        if (log) log('摘要已复制到剪贴板');
+      } catch (_) {
+        prompt('复制以下内容：', text);
+      }
+    }
+
+    G.exportCsv = exportCsv;
+    G.copySummary = copySummary;
+  })(S2A);
+
+
+/* ==== src/tools/grok-degrade/probe.js ==== */
+  // --- Grok degrade (降智) probe ---
+  // 复用 /admin/grok/accounts/{id}/quota 返回数据，判定账号是否被「降智」。
+  // 「降智」定义：账号生效/可用的模型不再是期望的高级模型（默认关键字 grok-4），
+  // 而被静默降级为低级模型（如 grok-3 / mini），或未观察到高级模型授权。
+  (function (S2A) {
+    const G = (S2A.tools['grok-degrade'] = S2A.tools['grok-degrade'] || {});
+    const { sleep } = S2A.util;
+
+    function quotaTool() {
+      return S2A.tools['grok-quota'] || {};
+    }
+
+    async function queryGrokQuota(accountId, timezone) {
+      const q = quotaTool();
+      if (typeof q.queryGrokQuota === 'function') {
+        return q.queryGrokQuota(accountId, timezone);
+      }
+      const tz = encodeURIComponent(timezone || 'Asia/Shanghai');
+      const path = `/admin/grok/accounts/${encodeURIComponent(accountId)}/quota?timezone=${tz}`;
+      return S2A.api.apiRequest(path);
+    }
+
+    function summarizeQuota(data) {
+      const q = quotaTool();
+      if (typeof q.summarizeQuota === 'function') return q.summarizeQuota(data);
+      return { ok: true, is403: false, model: data?.model || '', source: data?.source || '', raw: data };
+    }
+
+    function classifyProbeFailure(data, httpErr) {
+      const q = quotaTool();
+      if (typeof q.classifyProbeFailure === 'function') return q.classifyProbeFailure(data, httpErr);
+      const msg = httpErr ? httpErr.message || String(httpErr) : '';
+      const is403 = httpErr ? Number(httpErr.status || 0) === 403 : false;
+      return { failed: !!httpErr, is403, statusCode: httpErr?.status || 0, message: msg };
+    }
+
+    function collectModelBlob(sum) {
+      const raw = sum?.raw || {};
+      const snap = raw.snapshot || {};
+      const parts = [
+        sum?.model,
+        sum?.source,
+        raw.model,
+        raw.active_model,
+        raw.current_model,
+        raw.default_model,
+        raw.entitlement_status,
+        snap.model,
+        snap.entitlement_status,
+        raw.plan,
+        raw.tier,
+        raw.subscription_tier,
+        raw.billing?.period_type,
+      ]
+        .filter((x) => x != null && String(x).trim())
+        .map((x) => String(x));
+      return parts.join(' ').toLowerCase();
+    }
+
+    // 参考 grok2api / openai-cpa 的降智判定：真正决定是否被降级的是「高级模型配额窗口」，
+    // 而非 quota 里的 model/plan 字符串（后者常显示订阅套餐，账号仍会被静默降级）。
+    // 判定优先级：
+    //   1) 高级模型请求/令牌配额耗尽（remaining<=0 或窗口 limit<=0）→ 降智；
+    //   2) 命中降级关键字且未见期望模型 → 降智；
+    //   3) 命中期望模型且配额未耗尽 → 正常；
+    //   4) 数据缺失 → unknown（可配置视为降智）。
+    function judgeDegrade(sum, cfg) {
+      const blob = collectModelBlob(sum);
+      const expect = (cfg.expectKeywords || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
+      const degrade = (cfg.degradeKeywords || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
+
+      const matchedDegrade = degrade.find((k) => blob.includes(k)) || '';
+      const matchedExpect = expect.find((k) => blob.includes(k)) || '';
+
+      // --- 配额信号（grok2api 的核心依据）---
+      const reqRemaining = sum?.reqRemaining;
+      const reqLimit = sum?.reqLimit;
+      const tokRemaining = sum?.tokRemaining;
+      const tokLimit = sum?.tokLimit;
+      const hasReq = reqRemaining != null && reqLimit != null;
+      const hasTok = tokRemaining != null && tokLimit != null;
+      const hasQuota = hasReq || hasTok;
+
+      // 高级模型窗口不存在 / 上限为 0：授权中根本没有高级模型 → 视为已降级。
+      const noAdvancedWindow =
+        (hasReq && Number(reqLimit) <= 0) || (hasTok && Number(tokLimit) <= 0);
+      // 配额被打空：remaining<=0，Grok 会静默掉级到低级模型。
+      const quotaExhausted =
+        sum?.exhausted === true ||
+        (reqRemaining != null && Number(reqRemaining) <= 0) ||
+        (tokRemaining != null && Number(tokRemaining) <= 0);
+
+      if (noAdvancedWindow) {
+        return {
+          degraded: 'yes',
+          matchedExpect,
+          matchedDegrade,
+          blob,
+          reason: '高级模型配额窗口缺失/上限为 0（未授权高级模型）',
+        };
+      }
+      if (quotaExhausted) {
+        return {
+          degraded: 'yes',
+          matchedExpect,
+          matchedDegrade,
+          blob,
+          reason: `高级模型配额已耗尽（req ${sum?.reqText || '—'} / tok ${sum?.tokText || '—'}）`,
+        };
+      }
+
+      // --- 关键字兜底 ---
+      if (matchedDegrade && !matchedExpect) {
+        return {
+          degraded: 'yes',
+          matchedExpect,
+          matchedDegrade,
+          blob,
+          reason: `命中降级特征「${matchedDegrade}」且未见期望模型`,
+        };
+      }
+
+      // 命中期望模型 + 配额充足 → 正常。
+      if (matchedExpect) {
+        return {
+          degraded: 'no',
+          matchedExpect,
+          matchedDegrade,
+          blob,
+          reason: hasQuota
+            ? `命中期望模型「${matchedExpect}」且配额充足（req ${sum?.reqText || '—'}）`
+            : `命中期望模型「${matchedExpect}」`,
+        };
+      }
+
+      if (matchedDegrade) {
+        return { degraded: 'yes', matchedExpect, matchedDegrade, blob, reason: `命中降级特征「${matchedDegrade}」` };
+      }
+
+      // 无关键字命中，但有充足配额窗口 → 高级模型仍在授权，判正常。
+      if (hasQuota && !quotaExhausted) {
+        return {
+          degraded: 'no',
+          matchedExpect,
+          matchedDegrade,
+          blob,
+          reason: `高级模型配额窗口存在且未耗尽（req ${sum?.reqText || '—'} / tok ${sum?.tokText || '—'}）`,
+        };
+      }
+
+      if (!blob.trim() && !hasQuota) {
+        return {
+          degraded: cfg.treatUnknownAsDegraded ? 'yes' : 'unknown',
+          matchedExpect: '',
+          matchedDegrade: '',
+          blob,
+          reason: '未从 quota 观察到模型/授权/配额信息',
+        };
+      }
+
+      return {
+        degraded: cfg.treatUnknownAsDegraded ? 'yes' : 'unknown',
+        matchedExpect,
+        matchedDegrade,
+        blob,
+        reason: '未见期望模型关键字，且无配额信号（无法确认）',
+      };
+    }
+
+    function startCheck(opts) {
+      const { ids, accountMeta, results, cfg, log, onUpdate, getAbort } = opts;
+
+      let cursor = 0;
+      const workers = Array.from({ length: cfg.concurrency }, async () => {
+        while (!getAbort()) {
+          const i = cursor++;
+          if (i >= ids.length) break;
+          const id = ids[i];
+          const row = results.get(id);
+          if (!row) continue;
+          row.state = 'run';
+          if (onUpdate) onUpdate();
+
+          try {
+            if (cfg.delayMs > 0) await sleep(cfg.delayMs);
+            const data = await queryGrokQuota(id, cfg.timezone);
+            const sum = summarizeQuota(data);
+            row.name = row.name || accountMeta.get(id)?.name || '';
+            row.model = sum.model || '';
+            row.source = sum.source || '';
+            row.reqText = sum.reqText || '';
+            row.tokText = sum.tokText || '';
+
+            if (!sum.ok) {
+              row.state = 'err';
+              row.is403 = sum.is403;
+              row.error = sum.error || sum.note || '探测失败';
+              row.note = row.error;
+              if (log) log(`#${id} FAIL${sum.is403 ? ' 403' : ''} ${row.error}`);
+            } else {
+              const j = judgeDegrade(sum, cfg);
+              row.degraded = j.degraded;
+              row.judgeReason = j.reason;
+              row.modelBlob = j.blob;
+              if (j.degraded === 'yes') {
+                row.state = 'degraded';
+                row.note = `疑似降智：${j.reason}`;
+                if (log) log(`#${id} 降智  ${row.model || j.matchedDegrade || ''}  (${j.reason})`);
+              } else if (j.degraded === 'no') {
+                row.state = 'ok';
+                row.note = `正常：${j.reason}`;
+                if (log) log(`#${id} 正常  ${row.model || j.matchedExpect || ''}`);
+              } else {
+                row.state = 'unknown';
+                row.note = `无法确认：${j.reason}`;
+                if (log) log(`#${id} 未知  (${j.reason})`);
+              }
+            }
+          } catch (err) {
+            const fail = classifyProbeFailure(null, err);
+            row.state = 'err';
+            row.is403 = fail.is403;
+            row.error = fail.message || err.message || String(err);
+            row.note = row.error;
+            if (log) log(`#${id} FAIL${fail.is403 ? ' 403' : ''} ${row.error}`);
+          }
+          if (onUpdate) onUpdate();
+        }
+      });
+
+      return { done: Promise.all(workers).then(() => {}) };
+    }
+
+    G.queryGrokQuota = queryGrokQuota;
+    G.summarizeQuota = summarizeQuota;
+    G.collectModelBlob = collectModelBlob;
+    G.judgeDegrade = judgeDegrade;
+    G.startCheck = startCheck;
+  })(S2A);
+
+
+/* ==== src/tools/grok-degrade/panel.js ==== */
+  // --- Grok degrade panel ---
+  (function (S2A) {
+    const G = (S2A.tools['grok-degrade'] = S2A.tools['grok-degrade'] || {});
+    const { $, esc, parseIdsText } = S2A.util;
+
+    const TOOL_ID = 'grok-degrade';
+    const PREFIX = 's2a-tool-grok-degrade';
+
+    const DEFAULT_CFG = {
+      concurrency: 3,
+      delayMs: 200,
+      timezone: 'Asia/Shanghai',
+      onlyGrok: true,
+      expectKeywords: 'grok-4',
+      degradeKeywords: 'grok-3,grok-2,mini,fast,lite,downgrade',
+      treatUnknownAsDegraded: false,
+    };
+
+    function loadCfg() {
+      return S2A.storage.getToolCfg(TOOL_ID, DEFAULT_CFG);
+    }
+    function saveCfg(cfg) {
+      S2A.storage.setToolCfg(TOOL_ID, cfg);
+    }
+
+    function splitKeywords(text) {
+      return String(text || '')
+        .split(/[,，\n]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+
+    function mount(hostEl) {
+      let cfg = loadCfg();
+      let running = false;
+      let abortFlag = false;
+      /** @type {Map<string, any>} */
+      const results = new Map();
+      /** @type {Map<string, any>} */
+      let accountMeta = new Map();
+
+      const root = document.createElement('div');
+      root.id = `${PREFIX}-root`;
+      root.innerHTML = `
+        <div class="s2a-row">
+          <button type="button" class="s2a-btn s2a-btn-secondary" data-act="read-selected">读取勾选</button>
+          <button type="button" class="s2a-btn s2a-btn-secondary" data-act="read-page">读取本页</button>
+          <button type="button" class="s2a-btn s2a-btn-secondary" data-act="read-all-pages">拉取全部(API)</button>
+          <span class="s2a-muted" id="${PREFIX}-sel-info">未选择</span>
+        </div>
+        <div class="s2a-row">
+          <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-only-grok" ${cfg.onlyGrok !== false ? 'checked' : ''}> 仅 Grok</label>
+          <label class="s2a-lbl">并发 <input type="number" id="${PREFIX}-concurrency" min="1" max="20" value="${esc(cfg.concurrency)}"></label>
+          <label class="s2a-lbl">间隔ms <input type="number" id="${PREFIX}-delay" min="0" max="10000" value="${esc(cfg.delayMs)}"></label>
+          <label class="s2a-lbl">时区 <input type="text" id="${PREFIX}-tz" value="${esc(cfg.timezone)}" style="width:120px"></label>
+        </div>
+        <div class="s2a-row">
+          <label class="s2a-lbl" style="flex:1">期望模型关键字 <input type="text" id="${PREFIX}-expect" value="${esc(cfg.expectKeywords)}" style="width:100%" title="命中即判定为正常，逗号分隔"></label>
+        </div>
+        <div class="s2a-row">
+          <label class="s2a-lbl" style="flex:1">降级特征关键字 <input type="text" id="${PREFIX}-degrade" value="${esc(cfg.degradeKeywords)}" style="width:100%" title="命中且未见期望模型则判定为降智，逗号分隔"></label>
+        </div>
+        <div class="s2a-row">
+          <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-unknown-degraded" ${cfg.treatUnknownAsDegraded ? 'checked' : ''}> 无法确认时视为降智</label>
+        </div>
+        <div class="s2a-muted" style="margin-bottom:8px">
+          复用 /admin/grok/accounts/{id}/quota 返回的模型/授权信息判定降智：命中「降级特征」且未见「期望模型」→ 疑似降智。
+        </div>
+        <textarea id="${PREFIX}-ids" placeholder="账号 ID，每行一个。建议先点「读取勾选」或「读取本页」。&#10;示例：&#10;7752&#10;7753"></textarea>
+        <div class="s2a-row">
+          <button type="button" class="s2a-btn s2a-btn-primary" data-act="start">开始检测</button>
+          <button type="button" class="s2a-btn s2a-btn-secondary" data-act="stop" disabled>停止</button>
+          <button type="button" class="s2a-btn s2a-btn-secondary" data-act="export">导出 CSV</button>
+          <button type="button" class="s2a-btn s2a-btn-ok" data-act="copy-summary">复制摘要</button>
+        </div>
+        <div class="s2a-stats" style="grid-template-columns: repeat(5, 1fr)">
+          <div class="s2a-stat"><b id="${PREFIX}-st-total">0</b><span>总数</span></div>
+          <div class="s2a-stat"><b id="${PREFIX}-st-done">0</b><span>完成</span></div>
+          <div class="s2a-stat"><b id="${PREFIX}-st-degraded">0</b><span>降智</span></div>
+          <div class="s2a-stat"><b id="${PREFIX}-st-ok">0</b><span>正常</span></div>
+          <div class="s2a-stat"><b id="${PREFIX}-st-err">0</b><span>失败/未知</span></div>
+        </div>
+        <div class="s2a-progress"><i id="${PREFIX}-progress-bar"></i></div>
+        <div class="s2a-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>名称</th>
+                <th>结果</th>
+                <th>模型</th>
+                <th>备注</th>
+              </tr>
+            </thead>
+            <tbody id="${PREFIX}-tbody"></tbody>
+          </table>
+        </div>
+        <div class="s2a-log" id="${PREFIX}-log"></div>
+      `;
+      hostEl.appendChild(root);
+
+      function log(msg) {
+        const el = $(`#${PREFIX}-log`, root);
+        if (!el) return;
+        const ts = new Date().toLocaleTimeString();
+        el.textContent = `[${ts}] ${msg}\n` + el.textContent;
+      }
+
+      function fillIds(items) {
+        accountMeta = new Map();
+        const ids = [];
+        for (const it of items) {
+          const id = String(it.id || it).trim();
+          if (!id) continue;
+          ids.push(id);
+          accountMeta.set(id, {
+            id,
+            name: it.name || it.email || '',
+            platform: it.platform || '',
+            statusType: it.statusType || '',
+            statusText: it.statusText || it.statusType || '',
+          });
+        }
+        const ta = $(`#${PREFIX}-ids`, root);
+        if (ta) ta.value = ids.join('\n');
+        const info = $(`#${PREFIX}-sel-info`, root);
+        if (info) info.textContent = `已装载 ${ids.length} 个 ID`;
+      }
+
+      function updateStats() {
+        const all = Array.from(results.values());
+        const total = all.length;
+        const done = all.filter((x) => ['ok', 'degraded', 'err', 'unknown'].includes(x.state)).length;
+        const degraded = all.filter((x) => x.state === 'degraded').length;
+        const ok = all.filter((x) => x.state === 'ok').length;
+        const err = all.filter((x) => x.state === 'err' || x.state === 'unknown').length;
+        const set = (id, v) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = String(v);
+        };
+        set(`${PREFIX}-st-total`, total);
+        set(`${PREFIX}-st-done`, done);
+        set(`${PREFIX}-st-degraded`, degraded);
+        set(`${PREFIX}-st-ok`, ok);
+        set(`${PREFIX}-st-err`, err);
+        const bar = document.getElementById(`${PREFIX}-progress-bar`);
+        if (bar) bar.style.width = total ? `${Math.round((done / total) * 100)}%` : '0%';
+      }
+
+      function renderTable() {
+        const tbody = document.getElementById(`${PREFIX}-tbody`);
+        if (!tbody) return;
+        const rank = { run: 0, degraded: 1, unknown: 2, err: 3, ok: 4, wait: 5 };
+        const rows = Array.from(results.values()).sort((a, b) => {
+          const ao = rank[a.state] ?? 9;
+          const bo = rank[b.state] ?? 9;
+          if (ao !== bo) return ao - bo;
+          return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
+        });
+
+        tbody.innerHTML = rows
+          .map((r) => {
+            let tag;
+            if (r.state === 'degraded') tag = `<span class="s2a-tag bad">降智</span>`;
+            else if (r.state === 'ok') tag = `<span class="s2a-tag ok">正常</span>`;
+            else if (r.state === 'unknown') tag = `<span class="s2a-tag warn">未知</span>`;
+            else if (r.state === 'err') tag = `<span class="s2a-tag bad">${r.is403 ? '403' : '失败'}</span>`;
+            else if (r.state === 'run') tag = `<span class="s2a-tag run">检测中</span>`;
+            else tag = `<span class="s2a-tag warn">等待</span>`;
+            const rowCls = r.state === 'degraded' || r.state === 'err' ? 'err' : r.state;
+            return `<tr class="${esc(rowCls)}">
+              <td>${esc(r.id)}</td>
+              <td>${esc(r.name || '—')}</td>
+              <td>${tag}</td>
+              <td>${esc(r.model || '—')}</td>
+              <td class="s2a-muted">${esc(r.note || r.error || '')}</td>
+            </tr>`;
+          })
+          .join('');
+      }
+
+      function readPanelCfg() {
+        const concurrency = Math.max(1, Math.min(20, Number($(`#${PREFIX}-concurrency`, root)?.value || cfg.concurrency) || 3));
+        const delayMs = Math.max(0, Math.min(10000, Number($(`#${PREFIX}-delay`, root)?.value || cfg.delayMs) || 0));
+        const timezone = ($(`#${PREFIX}-tz`, root)?.value || cfg.timezone || 'Asia/Shanghai').trim();
+        const onlyGrok = $(`#${PREFIX}-only-grok`, root)?.checked !== false;
+        const expectKeywords = ($(`#${PREFIX}-expect`, root)?.value ?? cfg.expectKeywords) || '';
+        const degradeKeywords = ($(`#${PREFIX}-degrade`, root)?.value ?? cfg.degradeKeywords) || '';
+        const treatUnknownAsDegraded = $(`#${PREFIX}-unknown-degraded`, root)?.checked === true;
+        cfg = { ...cfg, concurrency, delayMs, timezone, onlyGrok, expectKeywords, degradeKeywords, treatUnknownAsDegraded };
+        saveCfg(cfg);
+        return cfg;
+      }
+
+      function onlyGrokChecked() {
+        return $(`#${PREFIX}-only-grok`, root)?.checked !== false;
+      }
+
+      function collectOpts() {
+        return { onlyGrok: onlyGrokChecked(), panelRoot: root };
+      }
+
+      async function doStartCheck() {
+        if (running) return;
+        readPanelCfg();
+
+        let ids = parseIdsText($(`#${PREFIX}-ids`, root)?.value || '');
+        if (!ids.length) {
+          const selected = S2A.domAccounts.collectSelectedFromDom(collectOpts());
+          if (selected.length) {
+            fillIds(selected);
+            ids = selected.map((x) => x.id);
+          }
+        }
+        if (!ids.length) {
+          alert('请先勾选账号，或手动填入账号 ID');
+          return;
+        }
+
+        running = true;
+        abortFlag = false;
+        results.clear();
+        for (const id of ids) {
+          const meta = accountMeta.get(id) || {};
+          results.set(id, {
+            id,
+            name: meta.name || '',
+            state: 'wait',
+            model: '',
+            degraded: '',
+            note: '',
+            error: '',
+            is403: false,
+          });
+        }
+        updateStats();
+        renderTable();
+
+        const startBtn = root.querySelector('[data-act="start"]');
+        const stopBtn = root.querySelector('[data-act="stop"]');
+        if (startBtn) startBtn.disabled = true;
+        if (stopBtn) stopBtn.disabled = false;
+
+        const runCfg = {
+          ...cfg,
+          expectKeywords: splitKeywords(cfg.expectKeywords),
+          degradeKeywords: splitKeywords(cfg.degradeKeywords),
+        };
+
+        log(`开始检测 ${ids.length} 个账号，并发=${cfg.concurrency}，间隔=${cfg.delayMs}ms`);
+
+        const job = G.startCheck({
+          ids,
+          accountMeta,
+          results,
+          cfg: runCfg,
+          log,
+          onUpdate: () => {
+            renderTable();
+            updateStats();
+          },
+          getAbort: () => abortFlag,
+        });
+
+        await job.done;
+        running = false;
+        if (startBtn) startBtn.disabled = false;
+        if (stopBtn) stopBtn.disabled = true;
+        const degraded = Array.from(results.values()).filter((r) => r.state === 'degraded').length;
+        const ok = Array.from(results.values()).filter((r) => r.state === 'ok').length;
+        log(abortFlag ? '已停止' : `全部完成 · 降智=${degraded} · 正常=${ok}`);
+      }
+
+      function refreshSelectionCount() {
+        try {
+          const items = S2A.domAccounts.collectSelectedFromDom(collectOpts());
+          const info = $(`#${PREFIX}-sel-info`, root);
+          if (info && !$(`#${PREFIX}-ids`, root)?.value?.trim()) {
+            info.textContent = items.length ? `勾选 ${items.length} 个` : '未选择';
+          }
+        } catch (_) {}
+      }
+
+      const onClick = async (e) => {
+        const btn = e.target.closest('[data-act]');
+        if (!btn) return;
+        const act = btn.getAttribute('data-act');
+        if (act === 'read-selected') {
+          const items = S2A.domAccounts.collectSelectedFromDom(collectOpts());
+          fillIds(items);
+          log(`读取勾选：${items.length} 个`);
+          if (!items.length) alert('未勾选任何账号');
+          return;
+        }
+        if (act === 'read-page') {
+          const items = S2A.domAccounts.collectPageAccountsFromDom(collectOpts());
+          fillIds(items);
+          log(`读取本页：${items.length} 个`);
+          return;
+        }
+        if (act === 'read-all-pages') {
+          btn.disabled = true;
+          try {
+            const items = await S2A.domAccounts.fetchAllAccountIdsFromApi({
+              onlyGrok: onlyGrokChecked(),
+              timezone: ($(`#${PREFIX}-tz`, root)?.value || cfg.timezone || '').trim(),
+            });
+            fillIds(items);
+            log(`API 拉取完成：${items.length} 个账号`);
+          } catch (err) {
+            log(`API 拉取失败：${err.message || err}`);
+            alert(err.message || String(err));
+          } finally {
+            btn.disabled = false;
+          }
+          return;
+        }
+        if (act === 'start') return doStartCheck();
+        if (act === 'stop') {
+          abortFlag = true;
+          log('正在停止…');
+          return;
+        }
+        if (act === 'export') return G.exportCsv(results, log);
+        if (act === 'copy-summary') return G.copySummary(results, log);
+      };
+
+      root.addEventListener('click', onClick);
+
+      const selInterval = setInterval(() => {
+        if (document.getElementById(`${PREFIX}-root`)) refreshSelectionCount();
+      }, 2000);
+
+      refreshSelectionCount();
+
+      function dispose() {
+        abortFlag = true;
+        clearInterval(selInterval);
+        root.removeEventListener('click', onClick);
+        if (root.parentNode) root.parentNode.removeChild(root);
+      }
+
+      G._activeSession = {
+        fillIds,
+        log,
+        startCheck: doStartCheck,
+        getRunning: () => running,
+        abort: () => {
+          abortFlag = true;
+        },
+        readPanelCfg,
+        loadCfg: () => cfg,
+      };
+
+      return {
+        dispose,
+        fillIds,
+        log,
+        startCheck: doStartCheck,
+        getRunning: () => running,
+      };
+    }
+
+    G.DEFAULT_CFG = DEFAULT_CFG;
+    G.loadCfg = loadCfg;
+    G.saveCfg = saveCfg;
+    G.mount = mount;
+    G.PREFIX = PREFIX;
+    G.TOOL_ID = TOOL_ID;
+  })(S2A);
+
+
+/* ==== src/tools/grok-degrade/index.js ==== */
+  // --- Grok degrade tool registration ---
+  (function (S2A) {
+    const G = (S2A.tools['grok-degrade'] = S2A.tools['grok-degrade'] || {});
+    let session = null;
+
+    function register() {
+      S2A.registerTool({
+        id: 'grok-degrade',
+        name: 'Grok 批量降智检测',
+        description: '批量检测 Grok 账号是否被降智（模型降级）',
+        order: 15,
+        match: (ctx) => /\/admin\/accounts\b/.test(ctx.pathname),
+        barActions: () => [
+          {
+            id: 'open',
+            label: '批量降智检测',
+            onClick: () => {
+              S2A.openTool('grok-degrade');
+              setTimeout(() => {
+                if (!G._activeSession) return;
+                const items = S2A.domAccounts.collectSelectedFromDom({ onlyGrok: true });
+                if (items.length) {
+                  G._activeSession.fillIds(items);
+                  G._activeSession.log(`已从批量栏读取勾选 ${items.length} 个`);
+                }
+              }, 50);
+            },
+          },
+        ],
+        onInit() {},
+        onOpen(ctx, hostEl) {
+          if (session) {
+            try {
+              session.dispose();
+            } catch (_) {}
+            session = null;
+          }
+          session = G.mount(hostEl);
+          return () => {
+            if (session) {
+              try {
+                session.dispose();
+              } catch (_) {}
+              session = null;
+            }
+            G._activeSession = null;
+          };
+        },
+        onClose() {
+          if (G._activeSession && typeof G._activeSession.abort === 'function') {
+            G._activeSession.abort();
+          }
+          if (session) {
+            try {
+              session.dispose();
+            } catch (_) {}
+            session = null;
+          }
+          G._activeSession = null;
+        },
+        onRouteChange() {},
+      });
+    }
+
+    G.register = register;
+  })(S2A);
+
+
 /* ==== src/tools/delete-error-accounts/runner.js ==== */
   // --- Delete error accounts runner ---
   (function (S2A) {
@@ -3346,6 +4105,9 @@
 (function (S2A) {
   if (S2A.tools['grok-quota'] && typeof S2A.tools['grok-quota'].register === 'function') {
     S2A.tools['grok-quota'].register();
+  }
+  if (S2A.tools['grok-degrade'] && typeof S2A.tools['grok-degrade'].register === 'function') {
+    S2A.tools['grok-degrade'].register();
   }
   if (
     S2A.tools['delete-error-accounts'] &&

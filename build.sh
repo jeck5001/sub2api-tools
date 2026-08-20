@@ -20,6 +20,10 @@ FILES=(
   "src/tools/grok-quota/probe.js"
   "src/tools/grok-quota/panel.js"
   "src/tools/grok-quota/index.js"
+  "src/tools/grok-degrade/export.js"
+  "src/tools/grok-degrade/probe.js"
+  "src/tools/grok-degrade/panel.js"
+  "src/tools/grok-degrade/index.js"
   "src/tools/delete-error-accounts/runner.js"
   "src/tools/delete-error-accounts/panel.js"
   "src/tools/delete-error-accounts/index.js"
@@ -65,6 +69,10 @@ if ! head -n 1 "$OUT" | grep -q '==UserScript=='; then
 fi
 if ! grep -q 'Grok 批量额度探测' "$OUT"; then
   echo "ERROR: output missing grok tool registration" >&2
+  exit 1
+fi
+if ! grep -q 'Grok 批量降智检测' "$OUT"; then
+  echo "ERROR: output missing grok-degrade tool" >&2
   exit 1
 fi
 if ! grep -q '批量删除错误账号' "$OUT"; then
