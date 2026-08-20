@@ -11,9 +11,8 @@
       delayMs: 200,
       timezone: 'Asia/Shanghai',
       onlyGrok: true,
-      expectKeywords: 'grok-4',
-      degradeKeywords: 'grok-3,grok-2,mini,fast,lite,downgrade',
-      treatUnknownAsDegraded: false,
+      timeoutMs: 15000,
+      ssoText: '',
     };
 
     function loadCfg() {
@@ -21,13 +20,6 @@
     }
     function saveCfg(cfg) {
       S2A.storage.setToolCfg(TOOL_ID, cfg);
-    }
-
-    function splitKeywords(text) {
-      return String(text || '')
-        .split(/[,，\n]/)
-        .map((s) => s.trim())
-        .filter(Boolean);
     }
 
     function mount(hostEl) {
@@ -55,16 +47,13 @@
           <label class="s2a-lbl">时区 <input type="text" id="${PREFIX}-tz" value="${esc(cfg.timezone)}" style="width:120px"></label>
         </div>
         <div class="s2a-row">
-          <label class="s2a-lbl" style="flex:1">期望模型关键字 <input type="text" id="${PREFIX}-expect" value="${esc(cfg.expectKeywords)}" style="width:100%" title="命中即判定为正常，逗号分隔"></label>
-        </div>
-        <div class="s2a-row">
-          <label class="s2a-lbl" style="flex:1">降级特征关键字 <input type="text" id="${PREFIX}-degrade" value="${esc(cfg.degradeKeywords)}" style="width:100%" title="命中且未见期望模型则判定为降智，逗号分隔"></label>
-        </div>
-        <div class="s2a-row">
-          <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-unknown-degraded" ${cfg.treatUnknownAsDegraded ? 'checked' : ''}> 无法确认时视为降智</label>
+          <label class="s2a-lbl">超时ms <input type="number" id="${PREFIX}-timeout" min="3000" max="60000" value="${esc(cfg.timeoutMs || 15000)}" style="width:80px"></label>
         </div>
         <div class="s2a-muted" style="margin-bottom:8px">
-          复用 /admin/grok/accounts/{id}/quota 返回的模型/授权信息判定降智：命中「降级特征」且未见「期望模型」→ 疑似降智。
+          按 openai-cpa：用 SSO 请求 https://grok.com/ 解析 botFlagSource；botFlagSource != 0 即已降智。API 拿不到 SSO 时按 ID----sso 填。
+        </div>
+        <div class="s2a-row" style="margin-bottom:6px">
+          <label class="s2a-lbl" style="flex:1">SSO 清单 <textarea id="${PREFIX}-sso" rows="2" style="width:100%; min-height:46px" placeholder="账号ID----sso，每行一个；也可只填 ID，脚本尝试从 API 详情取 sso。">${esc(cfg.ssoText || '')}</textarea></label>
         </div>
         <textarea id="${PREFIX}-ids" placeholder="账号 ID，每行一个。建议先点「读取勾选」或「读取本页」。&#10;示例：&#10;7752&#10;7753"></textarea>
         <div class="s2a-row">
@@ -88,7 +77,7 @@
                 <th>ID</th>
                 <th>名称</th>
                 <th>结果</th>
-                <th>模型</th>
+                <th>botFlag</th>
                 <th>备注</th>
               </tr>
             </thead>
@@ -117,6 +106,8 @@
             id,
             name: it.name || it.email || '',
             platform: it.platform || '',
+            sso: it.sso || it.sso_token || '',
+            ssoSource: it.sso ? 'user input' : (it.sso_token ? 'user input' : ''),
             statusType: it.statusType || '',
             statusText: it.statusText || it.statusType || '',
           });
@@ -172,7 +163,7 @@
               <td>${esc(r.id)}</td>
               <td>${esc(r.name || '—')}</td>
               <td>${tag}</td>
-              <td>${esc(r.model || '—')}</td>
+              <td class="s2a-muted">${esc(r.botFlagSource != null ? String(r.botFlagSource) : (r.sso ? `bfs?` : '无SSO'))}</td>
               <td class="s2a-muted">${esc(r.note || r.error || '')}</td>
             </tr>`;
           })
@@ -184,10 +175,9 @@
         const delayMs = Math.max(0, Math.min(10000, Number($(`#${PREFIX}-delay`, root)?.value || cfg.delayMs) || 0));
         const timezone = ($(`#${PREFIX}-tz`, root)?.value || cfg.timezone || 'Asia/Shanghai').trim();
         const onlyGrok = $(`#${PREFIX}-only-grok`, root)?.checked !== false;
-        const expectKeywords = ($(`#${PREFIX}-expect`, root)?.value ?? cfg.expectKeywords) || '';
-        const degradeKeywords = ($(`#${PREFIX}-degrade`, root)?.value ?? cfg.degradeKeywords) || '';
-        const treatUnknownAsDegraded = $(`#${PREFIX}-unknown-degraded`, root)?.checked === true;
-        cfg = { ...cfg, concurrency, delayMs, timezone, onlyGrok, expectKeywords, degradeKeywords, treatUnknownAsDegraded };
+        const timeoutMs = Math.max(3000, Math.min(60000, Number($(`#${PREFIX}-timeout`, root)?.value || cfg.timeoutMs || 15000) || 15000));
+        const ssoText = $(`#${PREFIX}-sso`, root)?.value || cfg.ssoText || '';
+        cfg = { ...cfg, concurrency, delayMs, timezone, onlyGrok, timeoutMs, ssoText };
         saveCfg(cfg);
         return cfg;
       }
@@ -205,6 +195,31 @@
         readPanelCfg();
 
         let ids = parseIdsText($(`#${PREFIX}-ids`, root)?.value || '');
+        // 兼容 ID----sso 输入，同时单独支持 SSO 清单。
+        const ssoLines = String($(`#${PREFIX}-sso`, root)?.value || cfg.ssoText || '')
+          .split(/\r?\n/)
+          .map((x) => x.trim())
+          .filter(Boolean);
+        const ssoById = new Map();
+        for (const line of ssoLines) {
+          const parts = line.split(/\s*\|\s*|\s*,\s*|\s*;\s*|\s*----\s*/);
+          if (parts.length >= 2 && /^\d+$/.test(parts[0])) {
+            ssoById.set(parts[0].trim(), parts.slice(1).join(',').trim());
+          }
+        }
+        if (ssoById.size) {
+          const merged = [];
+          if (!ids.length) ids = Array.from(ssoById.keys());
+          for (const i of ids) {
+            merged.push(i);
+            if (!accountMeta.get(i)) accountMeta.set(i, { id: i, name: '' });
+            if (ssoById.get(i)) {
+              accountMeta.get(i).sso = ssoById.get(i);
+              accountMeta.get(i).ssoSource = 'user input';
+            }
+          }
+          ids = merged;
+        }
         if (!ids.length) {
           const selected = S2A.domAccounts.collectSelectedFromDom(collectOpts());
           if (selected.length) {
@@ -243,8 +258,8 @@
 
         const runCfg = {
           ...cfg,
-          expectKeywords: splitKeywords(cfg.expectKeywords),
-          degradeKeywords: splitKeywords(cfg.degradeKeywords),
+          fetchDetail: true,
+          timeoutMs: Number(cfg.timeoutMs || 15000),
         };
 
         log(`开始检测 ${ids.length} 个账号，并发=${cfg.concurrency}，间隔=${cfg.delayMs}ms`);

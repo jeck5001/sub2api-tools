@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sub2API Tools
 // @namespace    s2a.sub2api-tools
-// @version      2.2.3
+// @version      2.3.0
 // @description  Sub2API 管理后台工具集：Grok 额度探测、批量删除错误账号、批量删除停用账号等
 // @author       local
 // @license      MIT
@@ -25,7 +25,7 @@
 
   /** @type {any} */
   const S2A = (window.__S2A__ = window.__S2A__ || {});
-  S2A.version = '2.2.3';
+  S2A.version = '2.3.0';
   S2A.NS = 's2a';
   S2A.util = S2A.util || {};
   S2A.storage = S2A.storage || {};
@@ -2190,7 +2190,7 @@
         alert('没有可导出的结果');
         return;
       }
-      const header = ['id', 'name', 'state', 'degraded', 'model', 'note', 'error'];
+      const header = ['id', 'name', 'state', 'degraded', 'bot_flag_source', 'bot_flag_details', 'bot_flag_risk', 'bot_flag_denied', 'sso_source', 'note', 'error'];
       const lines = [header.join(',')];
       for (const r of rows) {
         const cols = [
@@ -2198,7 +2198,11 @@
           r.name,
           r.state,
           r.state === 'degraded' ? '1' : r.state === 'ok' ? '0' : '',
-          r.model,
+          r.botFlagSource != null ? String(r.botFlagSource) : '',
+          r.botFlagDetails || '',
+          r.botFlagRisk != null ? String(r.botFlagRisk) : '',
+          r.botFlagDenied ? '1' : '0',
+          r.ssoSource || '',
           r.note,
           r.error,
         ].map((v) => {
@@ -2228,12 +2232,12 @@
       ];
       if (degraded.length) {
         lines.push('疑似降智:');
-        degraded.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  模型:${r.model || '?'}  ${r.note || ''}`));
+        degraded.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  bfs=${r.botFlagSource != null ? r.botFlagSource : '?'}  ${r.note || ''}`));
         lines.push('');
       }
       if (unknown.length) {
         lines.push('无法确认:');
-        unknown.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  ${r.note || ''}`));
+        unknown.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  bfs=${r.botFlagSource != null ? r.botFlagSource : '?'}  ${r.note || ''}`));
         lines.push('');
       }
       if (err.length) {
@@ -2255,180 +2259,190 @@
 
 
 /* ==== src/tools/grok-degrade/probe.js ==== */
-  // --- Grok degrade (降智) probe ---
-  // 复用 /admin/grok/accounts/{id}/quota 返回数据，判定账号是否被「降智」。
-  // 「降智」定义：账号生效/可用的模型不再是期望的高级模型（默认关键字 grok-4），
-  // 而被静默降级为低级模型（如 grok-3 / mini），或未观察到高级模型授权。
+  // --- Grok degrade probe (openai-cpa botFlag logic) ---
+  // 参考 openai-cpa: 注册后拿 SSO 请求 https://grok.com/，解析 botFlagSource
+  // 和 botFlagDetails。botFlagSource != 0 表示账号已降智，policy=deny 表示被拒死号。
   (function (S2A) {
     const G = (S2A.tools['grok-degrade'] = S2A.tools['grok-degrade'] || {});
     const { sleep } = S2A.util;
 
-    function quotaTool() {
-      return S2A.tools['grok-quota'] || {};
+    function extractAccountSso(raw) {
+      const candidates = [];
+      function walk(value, depth) {
+        if (!value || depth > 8) return;
+        if (typeof value === 'string') {
+          if (/^(sso=)?eyJ/i.test(value)) candidates.push(value.replace(/^sso=/i, '').trim());
+          return;
+        }
+        if (Array.isArray(value)) {
+          for (const item of value) walk(item, depth + 1);
+          return;
+        }
+        if (typeof value === 'object') {
+          for (const [key, item] of Object.entries(value)) {
+            const k = String(key || '').toLowerCase();
+            if (k === 'sso' || k === 'sso_token' || k === 'ssotoken' || k === 'sso_tokens') {
+              if (Array.isArray(item)) {
+                for (const token of item) walk(token, depth + 1);
+              } else {
+                walk(item, depth + 1);
+              }
+            } else {
+              walk(item, depth + 1);
+            }
+          }
+        }
+      }
+      walk(raw, 0);
+      return candidates.find((x) => x && x.trim()) || '';
     }
 
-    async function queryGrokQuota(accountId, timezone) {
-      const q = quotaTool();
-      if (typeof q.queryGrokQuota === 'function') {
-        return q.queryGrokQuota(accountId, timezone);
+    async function fetchAccountDetail(accountId) {
+      const paths = [
+        `/admin/grok/accounts/${encodeURIComponent(accountId)}`,
+        `/admin/accounts/${encodeURIComponent(accountId)}`,
+        `/admin/grok/accounts/${encodeURIComponent(accountId)}/detail`,
+        `/admin/accounts/${encodeURIComponent(accountId)}/detail`,
+      ];
+      for (const path of paths) {
+        try {
+          const data = await S2A.api.apiRequest(path);
+          const sso = extractAccountSso(data);
+          if (sso) return { sso, source: path };
+        } catch (_) {}
       }
-      const tz = encodeURIComponent(timezone || 'Asia/Shanghai');
-      const path = `/admin/grok/accounts/${encodeURIComponent(accountId)}/quota?timezone=${tz}`;
-      return S2A.api.apiRequest(path);
+      return { sso: '', source: '' };
     }
 
-    function summarizeQuota(data) {
-      const q = quotaTool();
-      if (typeof q.summarizeQuota === 'function') return q.summarizeQuota(data);
-      return { ok: true, is403: false, model: data?.model || '', source: data?.source || '', raw: data };
+    function normalizeSso(value) {
+      let sso = String(value || '')
+        .trim()
+        .replace(/^["']+|["']+$/g, '');
+      if (sso.startsWith('sso=')) sso = sso.slice(4);
+      return sso.trim();
     }
 
-    function classifyProbeFailure(data, httpErr) {
-      const q = quotaTool();
-      if (typeof q.classifyProbeFailure === 'function') return q.classifyProbeFailure(data, httpErr);
-      const msg = httpErr ? httpErr.message || String(httpErr) : '';
-      const is403 = httpErr ? Number(httpErr.status || 0) === 403 : false;
-      return { failed: !!httpErr, is403, statusCode: httpErr?.status || 0, message: msg };
-    }
-
-    function collectModelBlob(sum) {
-      const raw = sum?.raw || {};
-      const snap = raw.snapshot || {};
-      const parts = [
-        sum?.model,
-        sum?.source,
-        raw.model,
-        raw.active_model,
-        raw.current_model,
-        raw.default_model,
-        raw.entitlement_status,
-        snap.model,
-        snap.entitlement_status,
-        raw.plan,
-        raw.tier,
-        raw.subscription_tier,
-        raw.billing?.period_type,
-      ]
-        .filter((x) => x != null && String(x).trim())
-        .map((x) => String(x));
-      return parts.join(' ').toLowerCase();
-    }
-
-    // 参考 grok2api / openai-cpa 的降智判定：真正决定是否被降级的是「高级模型配额窗口」，
-    // 而非 quota 里的 model/plan 字符串（后者常显示订阅套餐，账号仍会被静默降级）。
-    // 判定优先级：
-    //   1) 高级模型请求/令牌配额耗尽（remaining<=0 或窗口 limit<=0）→ 降智；
-    //   2) 命中降级关键字且未见期望模型 → 降智；
-    //   3) 命中期望模型且配额未耗尽 → 正常；
-    //   4) 数据缺失 → unknown（可配置视为降智）。
-    function judgeDegrade(sum, cfg) {
-      const blob = collectModelBlob(sum);
-      const expect = (cfg.expectKeywords || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-      const degrade = (cfg.degradeKeywords || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-
-      const matchedDegrade = degrade.find((k) => blob.includes(k)) || '';
-      const matchedExpect = expect.find((k) => blob.includes(k)) || '';
-
-      // --- 配额信号（grok2api 的核心依据）---
-      const reqRemaining = sum?.reqRemaining;
-      const reqLimit = sum?.reqLimit;
-      const tokRemaining = sum?.tokRemaining;
-      const tokLimit = sum?.tokLimit;
-      const hasReq = reqRemaining != null && reqLimit != null;
-      const hasTok = tokRemaining != null && tokLimit != null;
-      const hasQuota = hasReq || hasTok;
-
-      // 高级模型窗口不存在 / 上限为 0：授权中根本没有高级模型 → 视为已降级。
-      const noAdvancedWindow =
-        (hasReq && Number(reqLimit) <= 0) || (hasTok && Number(tokLimit) <= 0);
-      // 配额被打空：remaining<=0，Grok 会静默掉级到低级模型。
-      const quotaExhausted =
-        sum?.exhausted === true ||
-        (reqRemaining != null && Number(reqRemaining) <= 0) ||
-        (tokRemaining != null && Number(tokRemaining) <= 0);
-
-      if (noAdvancedWindow) {
-        return {
-          degraded: 'yes',
-          matchedExpect,
-          matchedDegrade,
-          blob,
-          reason: '高级模型配额窗口缺失/上限为 0（未授权高级模型）',
-        };
-      }
-      if (quotaExhausted) {
-        return {
-          degraded: 'yes',
-          matchedExpect,
-          matchedDegrade,
-          blob,
-          reason: `高级模型配额已耗尽（req ${sum?.reqText || '—'} / tok ${sum?.tokText || '—'}）`,
-        };
-      }
-
-      // --- 关键字兜底 ---
-      if (matchedDegrade && !matchedExpect) {
-        return {
-          degraded: 'yes',
-          matchedExpect,
-          matchedDegrade,
-          blob,
-          reason: `命中降级特征「${matchedDegrade}」且未见期望模型`,
-        };
-      }
-
-      // 命中期望模型 + 配额充足 → 正常。
-      if (matchedExpect) {
-        return {
-          degraded: 'no',
-          matchedExpect,
-          matchedDegrade,
-          blob,
-          reason: hasQuota
-            ? `命中期望模型「${matchedExpect}」且配额充足（req ${sum?.reqText || '—'}）`
-            : `命中期望模型「${matchedExpect}」`,
-        };
-      }
-
-      if (matchedDegrade) {
-        return { degraded: 'yes', matchedExpect, matchedDegrade, blob, reason: `命中降级特征「${matchedDegrade}」` };
-      }
-
-      // 无关键字命中，但有充足配额窗口 → 高级模型仍在授权，判正常。
-      if (hasQuota && !quotaExhausted) {
-        return {
-          degraded: 'no',
-          matchedExpect,
-          matchedDegrade,
-          blob,
-          reason: `高级模型配额窗口存在且未耗尽（req ${sum?.reqText || '—'} / tok ${sum?.tokText || '—'}）`,
-        };
-      }
-
-      if (!blob.trim() && !hasQuota) {
-        return {
-          degraded: cfg.treatUnknownAsDegraded ? 'yes' : 'unknown',
-          matchedExpect: '',
-          matchedDegrade: '',
-          blob,
-          reason: '未从 quota 观察到模型/授权/配额信息',
-        };
-      }
-
-      return {
-        degraded: cfg.treatUnknownAsDegraded ? 'yes' : 'unknown',
-        matchedExpect,
-        matchedDegrade,
-        blob,
-        reason: '未见期望模型关键字，且无配额信号（无法确认）',
+    function parseGrokState(htmlText) {
+      const raw = String(htmlText || '');
+      const result = {
+        found: false,
+        botFlagSource: null,
+        botFlagDetails: '',
+        details: {},
+        policy: '',
+        event: '',
+        risk: null,
+        denied: false,
+        cloudflare: false,
+        ssoInvalid: false,
+        error: '',
       };
+
+      if (/Just a moment|cf-browser-verification|cf-turnstile/i.test(raw)) {
+        result.cloudflare = true;
+        result.error = '被 CF 拦截';
+        return result;
+      }
+      if (/Sign in to xAI|sign in/i.test(raw)) {
+        result.ssoInvalid = true;
+        result.error = 'SSO 无效';
+        return result;
+      }
+
+      const normalized = raw.replace(/\\"/g, '"');
+      const sourceMatch = normalized.match(/botFlagSource"\s*:\s*(null|-?\d+|"[^"]*")/);
+      const detailsMatch = normalized.match(/botFlagDetails"\s*:\s*(?:null|"([^"]*)")/);
+
+      if (sourceMatch && sourceMatch[1] !== 'null') {
+        let rawSource = sourceMatch[1].replace(/^"|"$/g, '');
+        const numSource = Number(rawSource);
+        result.botFlagSource = Number.isFinite(numSource) ? numSource : rawSource;
+      }
+
+      const detailsRaw = detailsMatch && detailsMatch[1] ? detailsMatch[1] : '';
+      result.botFlagDetails = detailsRaw;
+
+      const detailFields = {};
+      for (const item of detailsRaw.split(',')) {
+        const sep = item.indexOf('=');
+        if (sep > 0) {
+          const key = item.slice(0, sep).trim().toLowerCase();
+          const value = item.slice(sep + 1).trim();
+          if (key) detailFields[key] = value;
+        }
+      }
+      result.details = detailFields;
+      if (detailFields.risk) {
+        const risk = Number(detailFields.risk);
+        result.risk = Number.isFinite(risk) ? risk : null;
+      }
+      result.policy = String(detailFields.policy || '').toLowerCase();
+      result.event = String(detailFields.event || '');
+      result.denied = result.policy === 'deny' && result.event === '$registration';
+      result.found = sourceMatch !== null || detailsMatch !== null;
+      if (!result.found) result.error = '未找到 botFlag 字段';
+      return result;
     }
 
-    function startCheck(opts) {
-      const { ids, accountMeta, results, cfg, log, onUpdate, getAbort } = opts;
+    async function fetchGrokHome(sso, opts = {}) {
+      const url = 'https://grok.com/';
+      const headers = {
+        'Accept': 'text/html,application/json',
+        'User-Agent': opts.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36',
+        'Cookie': `sso=${sso}; sso-rw=${sso}`,
+        ...(opts.headers || {}),
+      };
+      if (typeof GM_xmlhttpRequest === 'function') {
+        return new Promise((resolve, reject) => {
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url,
+            headers,
+            timeout: opts.timeout || 15000,
+            onload(resp) {
+              resolve({ status: resp.status, text: resp.responseText || '' });
+            },
+            onerror: () => reject(new Error('grok.com 请求失败')),
+            ontimeout: () => reject(new Error('grok.com 请求超时')),
+          });
+        });
+      }
+      const resp = await fetch(url, { method: 'GET', headers, redirect: 'follow' });
+      const text = await resp.text();
+      return { status: resp.status, text };
+    }
 
+    function judgeGrokState(state, ssoOk) {
+      if (!ssoOk) {
+        return { degraded: 'no', state: 'err', reason: '缺少 SSO，无法按 openai-cpa 校验 botFlag' };
+      }
+      if (state.cloudflare) {
+        return { degraded: 'unknown', state: 'err', reason: `CF 拦截，需更换检测代理：${state.error}` };
+      }
+      if (state.ssoInvalid) {
+        return { degraded: 'yes', state: 'degraded', reason: `SSO 无效/已死：${state.error}` };
+      }
+      if (state.denied) {
+        return { degraded: 'yes', state: 'degraded', reason: `风控拒绝死号（${state.policy}/${state.event}）` };
+      }
+      if (state.found) {
+        if (state.botFlagSource === 0) {
+          return { degraded: 'no', state: 'ok', reason: '账号智商正常 (botFlagSource=0)' };
+        }
+        const detail = state.botFlagDetails ? ` ${state.botFlagDetails}` : '';
+        return {
+          degraded: 'yes',
+          state: 'degraded',
+          reason: `账号已降智(bfs=${state.botFlagSource})${detail}，可能需更换IP`,
+        };
+      }
+      return { degraded: 'unknown', state: 'err', reason: state.error || '未找到 botFlag 字段' };
+    }
+
+    async function startCheck(opts) {
+      const { ids, accountMeta, results, cfg, log, onUpdate, getAbort } = opts;
       let cursor = 0;
-      const workers = Array.from({ length: cfg.concurrency }, async () => {
+      const workers = Array.from({ length: cfg.concurrency || 1 }, async () => {
         while (!getAbort()) {
           const i = cursor++;
           if (i >= ids.length) break;
@@ -2440,46 +2454,69 @@
 
           try {
             if (cfg.delayMs > 0) await sleep(cfg.delayMs);
-            const data = await queryGrokQuota(id, cfg.timezone);
-            const sum = summarizeQuota(data);
-            row.name = row.name || accountMeta.get(id)?.name || '';
-            row.model = sum.model || '';
-            row.source = sum.source || '';
-            row.reqText = sum.reqText || '';
-            row.tokText = sum.tokText || '';
+            let sso = row.sso || accountMeta.get(id)?.sso || '';
+            let ssoSource = row.ssoSource || accountMeta.get(id)?.ssoSource || '';
+            if (!sso && cfg.fetchDetail !== false) {
+              const detail = await fetchAccountDetail(id);
+              sso = sso || detail.sso;
+              ssoSource = detail.source || 'API详情';
+              if (sso) {
+                accountMeta.get(id).sso = sso;
+                accountMeta.get(id).ssoSource = ssoSource;
+              }
+            }
+            row.sso = sso;
+            row.ssoSource = ssoSource || (sso ? 'user input' : '');
 
-            if (!sum.ok) {
+            if (!sso) {
+              row.probeState = 'no_sso';
+              row.judgeReason = '缺少 SSO，可手动填 ID----sso 或从 API 详情获取';
+              row.degraded = 'unknown';
               row.state = 'err';
-              row.is403 = sum.is403;
-              row.error = sum.error || sum.note || '探测失败';
+              row.error = row.judgeReason;
               row.note = row.error;
-              if (log) log(`#${id} FAIL${sum.is403 ? ' 403' : ''} ${row.error}`);
+              if (log) log(`#${id} 缺 SSO（未从 API/DOM 拿到）`);
             } else {
-              const j = judgeDegrade(sum, cfg);
-              row.degraded = j.degraded;
-              row.judgeReason = j.reason;
-              row.modelBlob = j.blob;
-              if (j.degraded === 'yes') {
-                row.state = 'degraded';
-                row.note = `疑似降智：${j.reason}`;
-                if (log) log(`#${id} 降智  ${row.model || j.matchedDegrade || ''}  (${j.reason})`);
-              } else if (j.degraded === 'no') {
-                row.state = 'ok';
-                row.note = `正常：${j.reason}`;
-                if (log) log(`#${id} 正常  ${row.model || j.matchedExpect || ''}`);
+              const fetched = await fetchGrokHome(sso, { timeout: cfg.timeoutMs || 15000 });
+              if (fetched.status >= 400) {
+                row.state = 'err';
+                row.probeState = 'http_error';
+                row.probeReason = `grok.com HTTP ${fetched.status}`;
+                row.degraded = 'unknown';
+                row.error = row.probeReason;
+                row.note = row.error;
+                if (log) log(`#${id} grok.com HTTP ${fetched.status}`);
               } else {
-                row.state = 'unknown';
-                row.note = `无法确认：${j.reason}`;
-                if (log) log(`#${id} 未知  (${j.reason})`);
+                const state = parseGrokState(fetched.text);
+                row.probeState = state.found ? 'parsed' : 'unparsed';
+                row.botFlagSource = state.botFlagSource;
+                row.botFlagDetails = state.botFlagDetails;
+                row.botFlagRisk = state.risk;
+                row.botFlagDenied = state.denied;
+                const j = judgeGrokState(state, true);
+                row.degraded = j.degraded;
+                row.probeReason = j.reason;
+                if (j.state === 'degraded') {
+                  row.state = 'degraded';
+                  row.note = `疑似降智：${j.reason}`;
+                  if (log) log(`#${id} 降智（botFlagSource=${state.botFlagSource ?? ''}）`);
+                } else if (j.state === 'ok') {
+                  row.state = 'ok';
+                  row.note = `正常：${j.reason}`;
+                  if (log) log(`#${id} 正常（botFlagSource=${state.botFlagSource ?? ''}）`);
+                } else {
+                  row.state = 'err';
+                  row.error = j.reason;
+                  row.note = row.error;
+                  if (log) log(`#${id} FAIL ${j.reason}`);
+                }
               }
             }
           } catch (err) {
-            const fail = classifyProbeFailure(null, err);
             row.state = 'err';
-            row.is403 = fail.is403;
-            row.error = fail.message || err.message || String(err);
+            row.error = String(err.message || err);
             row.note = row.error;
-            if (log) log(`#${id} FAIL${fail.is403 ? ' 403' : ''} ${row.error}`);
+            if (log) log(`#${id} ERR ${row.error}`);
           }
           if (onUpdate) onUpdate();
         }
@@ -2488,10 +2525,12 @@
       return { done: Promise.all(workers).then(() => {}) };
     }
 
-    G.queryGrokQuota = queryGrokQuota;
-    G.summarizeQuota = summarizeQuota;
-    G.collectModelBlob = collectModelBlob;
-    G.judgeDegrade = judgeDegrade;
+    G.extractAccountSso = extractAccountSso;
+    G.fetchAccountDetail = fetchAccountDetail;
+    
+    G.parseGrokState = parseGrokState;
+    G.fetchGrokHome = fetchGrokHome;
+    G.judgeGrokState = judgeGrokState;
     G.startCheck = startCheck;
   })(S2A);
 
@@ -2510,9 +2549,8 @@
       delayMs: 200,
       timezone: 'Asia/Shanghai',
       onlyGrok: true,
-      expectKeywords: 'grok-4',
-      degradeKeywords: 'grok-3,grok-2,mini,fast,lite,downgrade',
-      treatUnknownAsDegraded: false,
+      timeoutMs: 15000,
+      ssoText: '',
     };
 
     function loadCfg() {
@@ -2520,13 +2558,6 @@
     }
     function saveCfg(cfg) {
       S2A.storage.setToolCfg(TOOL_ID, cfg);
-    }
-
-    function splitKeywords(text) {
-      return String(text || '')
-        .split(/[,，\n]/)
-        .map((s) => s.trim())
-        .filter(Boolean);
     }
 
     function mount(hostEl) {
@@ -2554,16 +2585,13 @@
           <label class="s2a-lbl">时区 <input type="text" id="${PREFIX}-tz" value="${esc(cfg.timezone)}" style="width:120px"></label>
         </div>
         <div class="s2a-row">
-          <label class="s2a-lbl" style="flex:1">期望模型关键字 <input type="text" id="${PREFIX}-expect" value="${esc(cfg.expectKeywords)}" style="width:100%" title="命中即判定为正常，逗号分隔"></label>
-        </div>
-        <div class="s2a-row">
-          <label class="s2a-lbl" style="flex:1">降级特征关键字 <input type="text" id="${PREFIX}-degrade" value="${esc(cfg.degradeKeywords)}" style="width:100%" title="命中且未见期望模型则判定为降智，逗号分隔"></label>
-        </div>
-        <div class="s2a-row">
-          <label class="s2a-lbl"><input type="checkbox" id="${PREFIX}-unknown-degraded" ${cfg.treatUnknownAsDegraded ? 'checked' : ''}> 无法确认时视为降智</label>
+          <label class="s2a-lbl">超时ms <input type="number" id="${PREFIX}-timeout" min="3000" max="60000" value="${esc(cfg.timeoutMs || 15000)}" style="width:80px"></label>
         </div>
         <div class="s2a-muted" style="margin-bottom:8px">
-          复用 /admin/grok/accounts/{id}/quota 返回的模型/授权信息判定降智：命中「降级特征」且未见「期望模型」→ 疑似降智。
+          按 openai-cpa：用 SSO 请求 https://grok.com/ 解析 botFlagSource；botFlagSource != 0 即已降智。API 拿不到 SSO 时按 ID----sso 填。
+        </div>
+        <div class="s2a-row" style="margin-bottom:6px">
+          <label class="s2a-lbl" style="flex:1">SSO 清单 <textarea id="${PREFIX}-sso" rows="2" style="width:100%; min-height:46px" placeholder="账号ID----sso，每行一个；也可只填 ID，脚本尝试从 API 详情取 sso。">${esc(cfg.ssoText || '')}</textarea></label>
         </div>
         <textarea id="${PREFIX}-ids" placeholder="账号 ID，每行一个。建议先点「读取勾选」或「读取本页」。&#10;示例：&#10;7752&#10;7753"></textarea>
         <div class="s2a-row">
@@ -2587,7 +2615,7 @@
                 <th>ID</th>
                 <th>名称</th>
                 <th>结果</th>
-                <th>模型</th>
+                <th>botFlag</th>
                 <th>备注</th>
               </tr>
             </thead>
@@ -2616,6 +2644,8 @@
             id,
             name: it.name || it.email || '',
             platform: it.platform || '',
+            sso: it.sso || it.sso_token || '',
+            ssoSource: it.sso ? 'user input' : (it.sso_token ? 'user input' : ''),
             statusType: it.statusType || '',
             statusText: it.statusText || it.statusType || '',
           });
@@ -2671,7 +2701,7 @@
               <td>${esc(r.id)}</td>
               <td>${esc(r.name || '—')}</td>
               <td>${tag}</td>
-              <td>${esc(r.model || '—')}</td>
+              <td class="s2a-muted">${esc(r.botFlagSource != null ? String(r.botFlagSource) : (r.sso ? `bfs?` : '无SSO'))}</td>
               <td class="s2a-muted">${esc(r.note || r.error || '')}</td>
             </tr>`;
           })
@@ -2683,10 +2713,9 @@
         const delayMs = Math.max(0, Math.min(10000, Number($(`#${PREFIX}-delay`, root)?.value || cfg.delayMs) || 0));
         const timezone = ($(`#${PREFIX}-tz`, root)?.value || cfg.timezone || 'Asia/Shanghai').trim();
         const onlyGrok = $(`#${PREFIX}-only-grok`, root)?.checked !== false;
-        const expectKeywords = ($(`#${PREFIX}-expect`, root)?.value ?? cfg.expectKeywords) || '';
-        const degradeKeywords = ($(`#${PREFIX}-degrade`, root)?.value ?? cfg.degradeKeywords) || '';
-        const treatUnknownAsDegraded = $(`#${PREFIX}-unknown-degraded`, root)?.checked === true;
-        cfg = { ...cfg, concurrency, delayMs, timezone, onlyGrok, expectKeywords, degradeKeywords, treatUnknownAsDegraded };
+        const timeoutMs = Math.max(3000, Math.min(60000, Number($(`#${PREFIX}-timeout`, root)?.value || cfg.timeoutMs || 15000) || 15000));
+        const ssoText = $(`#${PREFIX}-sso`, root)?.value || cfg.ssoText || '';
+        cfg = { ...cfg, concurrency, delayMs, timezone, onlyGrok, timeoutMs, ssoText };
         saveCfg(cfg);
         return cfg;
       }
@@ -2704,6 +2733,31 @@
         readPanelCfg();
 
         let ids = parseIdsText($(`#${PREFIX}-ids`, root)?.value || '');
+        // 兼容 ID----sso 输入，同时单独支持 SSO 清单。
+        const ssoLines = String($(`#${PREFIX}-sso`, root)?.value || cfg.ssoText || '')
+          .split(/\r?\n/)
+          .map((x) => x.trim())
+          .filter(Boolean);
+        const ssoById = new Map();
+        for (const line of ssoLines) {
+          const parts = line.split(/\s*\|\s*|\s*,\s*|\s*;\s*|\s*----\s*/);
+          if (parts.length >= 2 && /^\d+$/.test(parts[0])) {
+            ssoById.set(parts[0].trim(), parts.slice(1).join(',').trim());
+          }
+        }
+        if (ssoById.size) {
+          const merged = [];
+          if (!ids.length) ids = Array.from(ssoById.keys());
+          for (const i of ids) {
+            merged.push(i);
+            if (!accountMeta.get(i)) accountMeta.set(i, { id: i, name: '' });
+            if (ssoById.get(i)) {
+              accountMeta.get(i).sso = ssoById.get(i);
+              accountMeta.get(i).ssoSource = 'user input';
+            }
+          }
+          ids = merged;
+        }
         if (!ids.length) {
           const selected = S2A.domAccounts.collectSelectedFromDom(collectOpts());
           if (selected.length) {
@@ -2742,8 +2796,8 @@
 
         const runCfg = {
           ...cfg,
-          expectKeywords: splitKeywords(cfg.expectKeywords),
-          degradeKeywords: splitKeywords(cfg.degradeKeywords),
+          fetchDetail: true,
+          timeoutMs: Number(cfg.timeoutMs || 15000),
         };
 
         log(`开始检测 ${ids.length} 个账号，并发=${cfg.concurrency}，间隔=${cfg.delayMs}ms`);

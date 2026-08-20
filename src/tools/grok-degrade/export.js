@@ -8,7 +8,7 @@
         alert('没有可导出的结果');
         return;
       }
-      const header = ['id', 'name', 'state', 'degraded', 'model', 'note', 'error'];
+      const header = ['id', 'name', 'state', 'degraded', 'bot_flag_source', 'bot_flag_details', 'bot_flag_risk', 'bot_flag_denied', 'sso_source', 'note', 'error'];
       const lines = [header.join(',')];
       for (const r of rows) {
         const cols = [
@@ -16,7 +16,11 @@
           r.name,
           r.state,
           r.state === 'degraded' ? '1' : r.state === 'ok' ? '0' : '',
-          r.model,
+          r.botFlagSource != null ? String(r.botFlagSource) : '',
+          r.botFlagDetails || '',
+          r.botFlagRisk != null ? String(r.botFlagRisk) : '',
+          r.botFlagDenied ? '1' : '0',
+          r.ssoSource || '',
           r.note,
           r.error,
         ].map((v) => {
@@ -46,12 +50,12 @@
       ];
       if (degraded.length) {
         lines.push('疑似降智:');
-        degraded.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  模型:${r.model || '?'}  ${r.note || ''}`));
+        degraded.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  bfs=${r.botFlagSource != null ? r.botFlagSource : '?'}  ${r.note || ''}`));
         lines.push('');
       }
       if (unknown.length) {
         lines.push('无法确认:');
-        unknown.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  ${r.note || ''}`));
+        unknown.forEach((r) => lines.push(`#${r.id} ${r.name || ''}  bfs=${r.botFlagSource != null ? r.botFlagSource : '?'}  ${r.note || ''}`));
         lines.push('');
       }
       if (err.length) {
